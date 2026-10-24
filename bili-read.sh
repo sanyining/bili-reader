@@ -25,6 +25,7 @@ MODEL_DIR="$SCRIPT_DIR/models/sensevoice-onnx"
 VAD_PATH="$SCRIPT_DIR/models/silero_vad.onnx"
 PIP_INDEX="${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}"
 UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+MOBILE_UA="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 
 die() { printf '错误：%s\n' "$1" >&2; exit 1; }
 info() { printf '%s\n' "$1"; }
@@ -129,6 +130,101 @@ for bin in curl python3; do
   command -v "$bin" >/dev/null 2>&1 || die "缺少依赖：$bin"
 done
 
+# ------------------------------------------------------- 0b. 图文动态（opus）
+
+# B 站除视频外还有「图文动态」（opus，纯文字+图片）。
+# 它没有音频可转写，但文字是现成的 —— 直接抓页面 SSR 数据即可，2 秒出全文。
+read_opus() { # read_opus <opus_id> <输出目录>
+  local oid="$1" out="$2"
+  info "识别为图文动态（opus/${oid}），走图文抓取（无需语音识别）"
+  local tmp && tmp="$(mktemp -d)"
+  local page="$tmp/opus.html"
+  curl -sL -m 25 -A "$MOBILE_UA" -c "$tmp/ck" -b "$tmp/ck" \
+       -H 'Referer: https://www.bilibili.com' \
+       "https://m.bilibili.com/opus/$oid" -o "$page" || die "页面拉取失败"
+  local oid_arg="$1"
+  python3 - "$page" "$out" "$oid_arg" <<'PY'
+import json, os, re, sys, urllib.request
+
+page, out, oid_arg = sys.argv[1], sys.argv[2], sys.argv[3]
+html = open(page, encoding='utf-8', errors='ignore').read()
+m = re.search(r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\});', html, re.S)
+if not m:
+    sys.exit('页面里没有 SSR 数据（可能被风控，稍后重试或用完整链接）')
+try:
+    d = json.loads(m.group(1).replace('undefined', 'null'))
+except json.JSONDecodeError as e:
+    sys.exit(f'SSR 数据解析失败：{e}')
+
+det = d.get('opus', {}).get('detail')
+if not det:
+    sys.exit('SSR 数据里找不到 opus.detail（动态可能已被删除）')
+
+title = det.get('title') or ''
+author = (det.get('author') or {}).get('name') or ''
+if not author:  # 图文动态的作者在 AUTHOR 模块的 module_author.name
+    for _m in det.get('modules', []):
+        author = (_m.get('module_author') or {}).get('name') or ''
+        if author:
+            break
+imgs_dir = os.path.join(out, 'images')
+os.makedirs(imgs_dir, exist_ok=True)
+
+lines = []
+if title:
+    lines += [f'# {title}', '']
+lines.append(f'> 来源：B 站图文动态（opus/{oid_arg}）｜作者：{author or "未知"}｜本机离线抓取，未经云端')
+lines.append('')
+
+n_img = 0
+for mod in det.get('modules', []):
+    mc = mod.get('module_content')
+    if mod.get('module_type') == 'MODULE_TYPE_TITLE':
+        continue  # 标题已放头部
+    if not isinstance(mc, dict):
+        continue
+    for para in mc.get('paragraphs', []):
+        pt = para.get('para_type')
+        if pt == 1:  # 文本段落
+            txt = ''.join(
+                n.get('word', {}).get('words', '')
+                for n in para.get('text', {}).get('nodes', [])
+            ).strip()
+            if txt:
+                lines += [txt, '']
+        elif pt == 2:  # 图片段落
+            for pic in para.get('pic', {}).get('pics', []):
+                url = pic.get('url', '')
+                if not url:
+                    continue
+                n_img += 1
+                fn = f'img{n_img:02d}.png'
+                try:
+                    req = urllib.request.Request(url, headers={
+                        'User-Agent': 'Mozilla/5.0',
+                        'Referer': 'https://www.bilibili.com'})
+                    data = urllib.request.urlopen(req, timeout=20).read()
+                    open(os.path.join(imgs_dir, fn), 'wb').write(data)
+                    lines += [f'![图{n_img}]({fn})', '']
+                except Exception as exc:
+                    lines += [f'![图{n_img}]({url}) <!-- 下载失败：{exc} -->', '']
+if not title:
+    # 有的动态标题在正文首段，兜底用页面 <title>
+    mt = re.search(r'<title>(.*?)</title>', html)
+    if mt:
+        fallback = re.sub(r'\s*-\s*哔哩哔哩\s*$', '', mt.group(1).strip())
+        lines.insert(0, f'# {fallback}')
+        lines.insert(1, '')
+
+body = '\n'.join(lines)
+fn = os.path.join(out, '图文笔记.md')
+open(fn, 'w', encoding='utf-8').write(body)
+chars = len(re.sub(r'\s', '', body))
+print(f'完成：{chars} 字 / {n_img} 张图 -> {fn}')
+PY
+  rm -rf "$tmp"
+}
+
 # ---------------------------------------------------------------- 1. 拿 BV 号
 
 BV=""
@@ -138,6 +234,14 @@ case "$INPUT" in
     BV="$(printf '%s' "$FINAL" | grep -oE 'BV[0-9A-Za-z]{10}' | head -1 || true)"
     ;;
 esac
+OPUS_ID="$(printf '%s' "${FINAL:-}" | grep -oE 'opus/[0-9]+' | head -1 | cut -d/ -f2 || true)"
+[ -n "$OPUS_ID" ] || OPUS_ID="$(printf '%s' "$INPUT" | grep -oE 'opus/[0-9]+' | head -1 | cut -d/ -f2 || true)"
+if [ -n "$OPUS_ID" ]; then
+  mkdir -p "$OUTDIR"
+  read_opus "$OPUS_ID" "$OUTDIR"
+  exit 0
+fi
+
 [ -n "$BV" ] || BV="$(printf '%s' "$INPUT" | grep -oE 'BV[0-9A-Za-z]{10}' | head -1 || true)"
 [ -n "$BV" ] || die "没能从输入里认出 BV 号（若短链已失效，请直接给完整视频地址）"
 info "视频编号：$BV"
