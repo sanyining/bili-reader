@@ -26,6 +26,25 @@ import Foundation
 import AVFoundation
 import AppKit
 import CoreMedia
+import Vision
+
+// MARK: - 画面文字 OCR（Apple Vision，本地免费，中文优先）
+
+func ocrFrame(_ cgImage: CGImage) -> String? {
+    let request = VNRecognizeTextRequest()
+    request.recognitionLevel = .accurate
+    request.recognitionLanguages = ["zh-Hans", "en-US"]
+    request.usesLanguageCorrection = false   // 字幕/术语要逐字保留，不做自动纠错
+    let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+    do {
+        try handler.perform([request])
+    } catch {
+        return nil
+    }
+    let lines = (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
+    let joined = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    return joined.isEmpty ? nil : joined
+}
 
 // MARK: - 输出
 
@@ -181,7 +200,7 @@ func extractAudio(asset: AVURLAsset, outPath: String) async throws -> [String: A
 // MARK: - 抽帧
 
 func extractFrames(asset: AVURLAsset, outDir: String, interval: Double,
-                   maxFrames: Int, durationSec: Double) async throws -> [[String: Any]] {
+                   maxFrames: Int, durationSec: Double, ocr: Bool) async throws -> [[String: Any]] {
     let gen = AVAssetImageGenerator(asset: asset)
     gen.appliesPreferredTrackTransform = true
     // 容差给 interval/4：换解码关键帧，速度快很多；对字幕 OCR 来说 ±0.4s 无感
@@ -210,11 +229,16 @@ func extractFrames(asset: AVURLAsset, outDir: String, interval: Double,
             let name = String(format: "f%04d.png", i)
             let p = "\(outDir)/\(name)"
             try png.write(to: URL(fileURLWithPath: p))
-            frames.append([
+            var frame: [String: Any] = [
                 "path": p,
                 "t": (ts * 10).rounded() / 10,
                 "bytes": png.count,
-            ])
+            ]
+            if ocr {
+                // OCR 在抽取线程同步做；accurate 级单帧约 0.2-0.5s
+                frame["text"] = ocrFrame(cg) ?? ""
+            }
+            frames.append(frame)
         } catch {
             stderr("第 \(i) 帧（\(ts)s）抽取失败：\(error.localizedDescription)")
         }
@@ -313,10 +337,11 @@ Task {
         }
 
         if !videoTracks.isEmpty && !noFrames {
+            let wantOCR = argv.contains("--ocr")
             let frames = try await extractFrames(
                 asset: asset, outDir: outDir,
                 interval: max(0.5, interval), maxFrames: max(10, maxFrames),
-                durationSec: durationSec)
+                durationSec: durationSec, ocr: wantOCR)
             result["frames"] = frames
             result["frameCount"] = frames.count
         } else if noFrames {

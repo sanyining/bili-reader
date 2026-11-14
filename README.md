@@ -1,9 +1,9 @@
 # bili-read
 
-给一个 B 站视频链接，在**本机离线**把它的语音全部转成文字，输出一份带元数据的 Markdown。
-不上传音频、不登录账号、没有次数限制、不按次收费。
+给一个 B 站链接，在**本机离线**读懂它：语音逐字稿 + 画面关键帧（含画面文字 OCR）+ 弹幕 + 热门评论，输出一份 Markdown。
+不上传内容、不登录账号、没有次数限制、不按次收费。
 
-> Feed a Bilibili link, get a full transcript as Markdown — **fully offline, on your own machine**.
+> Feed a Bilibili link, get transcript + key frames (with on-screen text OCR) + danmaku + top comments — **fully offline, on your own machine**.
 
 实测：9 分 27 秒的视频，端到端 **13 秒**出 3400+ 字逐字稿（41 段，0 段失败，识别速度约 73 倍实时）。
 
@@ -14,12 +14,22 @@
 B 站的官方字幕接口对多数视频返回空列表（`subtitle.list: []`），所以"抓字幕"这条路走不通。
 本工具走的是：**取音频流 → 本地解码 → 本地语音识别**，因此对**没有字幕的视频同样有效**。
 
+四个通道，全部免登录：
+
+| 通道 | 来源 | 说明 |
+|---|---|---|
+| 逐字稿 | 音频流 + SenseVoice（本机） | 全量、离线，约 70 倍实时 |
+| 画面关键帧 | 低码率视频流 + AVFoundation 抽帧 | 默认 ~20 张，Apple Vision OCR 读画面文字（字幕/标题/数据） |
+| 弹幕 | `x/v1/dm/list.so` | 全量去重按 30 秒聚合 + 刷屏统计，不会把 md 撑爆 |
+| 热门评论 | `x/v2/reply` 旧接口 | 免登录只能拿热门第一页（约 3-20 条） |
+
+画面文字 OCR 是逐字稿之外的第二信息源：**UP 主没念出来、只打在画面上的信息**（项目名、表格、代码）都能抓到。
+
 ## 它不做什么
 
-- 不下载视频画面
 - 不登录、不使用 Cookie
 - 不把任何内容上传到云端
-- 不做 AI 总结（只负责把语音变成准确的文字，总结交给你的大模型）
+- 不做 AI 总结（只负责把素材变成准确的文字，总结交给你的大模型）
 
 ## 快速开始
 
@@ -38,9 +48,14 @@ chmod +x bili-read.sh
 ```bash
 ./bili-read.sh BV13cBKBhEob              # 用 BV 号
 ./bili-read.sh BV13cBKBhEob ~/notes      # 指定输出目录
+
+BILI_NO_FRAMES=1 ./bili-read.sh <链接>     # 只要逐字稿（省下载视频流+OCR 的时间）
+BILI_NO_DANMAKU=1 ./bili-read.sh <链接>    # 不要弹幕
+BILI_NO_COMMENTS=1 ./bili-read.sh <链接>   # 不要评论
+./bili-read.sh b23.tv/9z8z4Qr            # 图文动态（opus）也支持：只抓正文+图片，2 秒出稿
 ```
 
-输出文件名：`<BV号>_<视频标题>.md`，内容为元数据 + 完整逐字稿。
+输出文件名：`<BV号>_<视频标题>.md`，内容为元数据 + 逐字稿 + 画面关键帧（`images/<BV号>/` 下的 PNG，配画面文字）+ 弹幕 + 热门评论。
 
 ## 前置条件
 
