@@ -136,6 +136,103 @@ for bin in curl python3; do
   command -v "$bin" >/dev/null 2>&1 || die "缺少依赖：$bin"
 done
 
+# ------------------------------------------------------- 0a. 本地文件模式
+
+# 非在线平台通道：给一个本机媒体文件（mp4/mov/m4v/m4a/mp3/wav…）直接走本地识别。
+# 用途：抖音、视频号等无法免登录抓取视频流的平台——在手机上「保存到相册」，
+# 文件传到电脑后喂给本命令，逐字稿/画面 OCR 引擎与 B 站通道完全一致。
+read_local() { # read_local <文件路径> <输出目录>
+  local f="$1" out="$2"
+  f="$(python3 -c "import os,sys;print(os.path.abspath(sys.argv[1]))" "$f")"
+  [ -s "$f" ] || die "本地文件不存在或为空：$f"
+  local key
+  key="$(basename "$f")"; key="${key%.*}"
+  key="$(printf '%s' "$key" | tr '/\\:*?"<>| ' '___________')"
+  local w
+  w="$(mktemp -d)"
+  LOCAL_WORK="$w"  # 全局：EXIT trap 触发时 local 变量已销毁，trap 只能读全局
+  cleanup_local() { rm -rf "${LOCAL_WORK:-}"; }
+  trap cleanup_local EXIT
+
+  mkdir -p "$out" "$w/out"
+  info "本地文件模式：$(basename "$f")"
+  build_helper
+  ensure_venv
+
+  # 1. 音轨（顺便拿时长）
+  "$HELPER" extract "$f" "$w/out" > "$w/extract.json" 2>/dev/null
+  grep -q '"ok":true' "$w/extract.json" || die "音轨解码失败：$(head -c 200 "$w/extract.json")"
+  local dur
+  dur="$(python3 -c "import json;print(json.load(open('$w/extract.json')).get('audio',{}).get('seconds',0))")"
+  [ -f "$w/out/audio.wav" ] || die "该文件没有音频轨（无法转写语音）。若是纯视频流（如 B 站 DASH video-only），请换含声音的完整文件。"
+  info "时长：${dur%.*} 秒"
+
+  # 2. 关键帧 + 画面 OCR（可选，与 B 站通道同一开关）
+  local frame_md=""
+  if [ "${BILI_NO_FRAMES:-0}" != "1" ]; then
+    local interval
+    interval="$(awk "BEGIN{v=$dur/20; print (v<3)?3:v}")"
+    "$HELPER" extract "$f" "$w/out" --interval "$interval" --max-frames 25 --ocr \
+      > "$w/frames.json" 2>/dev/null || true
+    if grep -q '"frameCount":[1-9]' "$w/frames.json" 2>/dev/null; then
+      mkdir -p "$out/images/$key"
+      cp "$w/out"/f*.png "$out/images/$key/" 2>/dev/null || true
+      frame_md="$w/frames.md"
+      python3 - "$w/frames.json" "$frame_md" "$key" "$interval" <<'PY'
+import json, os, sys
+frames = json.load(open(sys.argv[1])).get('frames') or []
+out, key, interval = sys.argv[2], sys.argv[3], float(sys.argv[4])
+lines = [f'每约 {interval:.0f} 秒抽一帧；画面文字为 Apple Vision 本地 OCR，可能有识别错误。', '']
+for fr in frames:
+    name = os.path.basename(fr['path'])
+    sec = float(fr['t'])
+    mm, ss = int(sec) // 60, int(sec) % 60
+    lines.append(f'![{mm:02d}:{ss:02d}](images/{key}/{name})')
+    text = (fr.get('text') or '').strip()
+    if text:
+        if len(text) > 200: text = text[:200] + '…'
+        lines += ['', '> 画面文字：' + text.replace('\n', ' ／ ')]
+    lines.append('')
+open(out, 'w', encoding='utf-8').write('\n'.join(lines))
+PY
+      info "画面关键帧：$(ls "$w/out"/f*.png 2>/dev/null | wc -l | tr -d ' ') 张"
+    else
+      info "（抽帧失败，跳过画面部分，不影响逐字稿）"
+    fi
+  fi
+
+  # 3. 语音识别（与 B 站同一引擎）
+  info "正在本地识别语音…"
+  "$VENV/bin/python" "$SCRIPT_DIR/src/asr.py" "$w/out/audio.wav" --json 2>"$w/asr.log" \
+    > "$w/transcript.txt" || { cat "$w/asr.log" >&2; die "语音识别失败"; }
+  [ -s "$w/transcript.txt" ] || die "识别结果为空"
+  local chars
+  chars="$(python3 -c "import sys;print(len(open(sys.argv[1],encoding='utf-8').read().replace(chr(10),'')))" "$w/transcript.txt")"
+  info "识别完成：${chars} 字"
+
+  # 4. 落盘
+  local o="$out/${key}_本地转写.md"
+  {
+    printf '%s\n' "# ${key}（本地文件转写）" ''
+    printf '%s\n' "- **来源文件**：${f}"
+    printf '%s\n' "- **时长**：$(awk "BEGIN{print int($dur/60)}") 分 $(awk "BEGIN{print int($dur%60)}") 秒"
+    printf '%s\n' "- **整理时间**：$(date '+%Y-%m-%d %H:%M')"
+    printf '%s\n' "- **来源**：语音 SenseVoice + 画面 OCR（Apple Vision），全程本机，转写可能存在同音字错误"
+    printf '%s\n' '' '---' '' '## 逐字稿' ''
+    cat "$w/transcript.txt"
+    if [ -n "$frame_md" ]; then
+      printf '%s\n' '' '---' '' '## 画面关键帧' ''
+      cat "$frame_md"
+    fi
+  } > "$o"
+  printf '\n已写入：%s\n' "$o"
+}
+
+if [ -f "$INPUT" ]; then
+  read_local "$INPUT" "$OUTDIR"
+  exit 0
+fi
+
 # ------------------------------------------------------- 0b. 图文动态（opus）
 
 # B 站除视频外还有「图文动态」（opus，纯文字+图片）。
